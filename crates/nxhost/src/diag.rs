@@ -61,15 +61,22 @@ extern "C" fn on_signal(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_v
         let uc = uc as *mut libc::ucontext_t;
         let mc = &*(*uc).uc_mcontext;
         let ss = &mc.__ss;
+        if sig == libc::SIGTRAP && TRACE_WRITERS.load(std::sync::atomic::Ordering::Relaxed) && writer_hit(mc.__es.__far, ss.__pc, mc.__es.__esr) {
+            disarm_current();
+            return;
+        }
         if sig == libc::SIGTRAP && WATCHING.load(std::sync::atomic::Ordering::Relaxed) && (*(ss.__pc as *const u32)) & 0x1F == 31 {
             disarm_current();
             return;
         }
         eprintln!(
-            "[fatal] signal {sig} at pc={} lr={} fault_addr={:#x}",
+            "[fatal] signal {sig} at pc={} lr={} fault_addr={:#x} far={:#x} esr={:#x} host_slide={:#x}",
             symbolize(ss.__pc),
             symbolize(ss.__lr),
-            (*info).si_addr as u64
+            (*info).si_addr as u64,
+            mc.__es.__far,
+            mc.__es.__esr,
+            host_slide()
         );
         for i in (0..29).step_by(4) {
             let mut line = String::new();
@@ -84,6 +91,14 @@ extern "C" fn on_signal(sig: i32, info: *mut libc::siginfo_t, uc: *mut libc::c_v
         crate::nvn::summary();
         libc::_exit(1);
     }
+}
+
+/// ASLR slide of the host executable, for `atos -o target/release/nxhost -s <slide>` on host frames of a crash report.
+fn host_slide() -> isize {
+    unsafe extern "C" {
+        fn _dyld_get_image_vmaddr_slide(image_index: u32) -> isize;
+    }
+    unsafe { _dyld_get_image_vmaddr_slide(0) }
 }
 
 pub fn install_altstack() {
@@ -152,6 +167,49 @@ pub fn start_watch(mods: &[(String, u64)]) {
 
 static WATCHING: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
 
+/// Writer tracing for probe.rs: which code stores to a handful of addresses. The signal handler only records into these
+/// fixed slots; `writers_take` drains them.
+static TRACE_WRITERS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+static WRITER_ADDRS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+const WRITER_SLOTS: usize = 8192;
+static WRITER_HITS: [std::sync::atomic::AtomicU64; WRITER_SLOTS * 2] = [const { std::sync::atomic::AtomicU64::new(0) }; WRITER_SLOTS * 2];
+static WRITER_N: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+
+fn writer_hit(far: u64, pc: u64, esr: u32) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    let watchpoint = matches!(esr >> 26, 0x34 | 0x35);
+    let Some(addr) = WRITER_ADDRS.iter().map(|a| a.load(Relaxed)).find(|&a| a != 0 && far <= a + 3 && far + 128 > a) else {
+        // A stale watchpoint from the previous group, still armed on this thread: drop it.
+        return watchpoint;
+    };
+    let i = WRITER_N.fetch_add(1, Relaxed);
+    if i < WRITER_SLOTS {
+        WRITER_HITS[i * 2].store(addr, Relaxed);
+        WRITER_HITS[i * 2 + 1].store(pc, Relaxed);
+    }
+    true
+}
+
+/// Arms (or re-arms, since a hit disarms the thread it happened on) store watchpoints on up to four addresses. Tracing
+/// stays on once started, so a hit from a watchpoint that another thread has not dropped yet is still absorbed.
+pub fn writers_watch(addrs: &[u64]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    for (i, slot) in WRITER_ADDRS.iter().enumerate() {
+        slot.store(addrs.get(i).copied().unwrap_or(0), Relaxed);
+    }
+    if !addrs.is_empty() {
+        TRACE_WRITERS.store(true, Relaxed);
+    }
+    arm_watchpoints(addrs);
+}
+
+/// (watched address, writing pc) pairs recorded since the last call.
+pub fn writers_take() -> Vec<(u64, u64)> {
+    use std::sync::atomic::Ordering::Relaxed;
+    let n = WRITER_N.swap(0, Relaxed).min(WRITER_SLOTS);
+    (0..n).map(|i| (WRITER_HITS[i * 2].load(Relaxed), WRITER_HITS[i * 2 + 1].load(Relaxed))).collect()
+}
+
 fn disarm_current() {
     unsafe extern "C" {
         fn mach_thread_self() -> u32;
@@ -177,6 +235,11 @@ struct ArmDebugState64 {
 }
 
 fn arm_all(addr: u64) {
+    arm_watchpoints(&[addr]);
+}
+
+/// Store watchpoints on up to four 4-byte slots, for every thread of the process.
+fn arm_watchpoints(addrs: &[u64]) {
     unsafe extern "C" {
         fn task_threads(task: u32, list: *mut *mut u32, count: *mut u32) -> i32;
         fn thread_set_state(thread: u32, flavor: i32, state: *const u32, count: u32) -> i32;
@@ -186,9 +249,11 @@ fn arm_all(addr: u64) {
     }
     const ARM_DEBUG_STATE64: i32 = 15;
     let mut st = ArmDebugState64 { bvr: [0; 16], bcr: [0; 16], wvr: [0; 16], wcr: [0; 16], mdscr_el1: 0 };
-    st.wvr[0] = addr & !7;
-    let bas = 0xFu64 << (addr & 7);
-    st.wcr[0] = 1 | (2 << 1) | (2 << 3) | (bas << 5);
+    for (i, &addr) in addrs.iter().take(4).enumerate() {
+        st.wvr[i] = addr & !7;
+        let bas = 0xFu64 << (addr & 7);
+        st.wcr[i] = 1 | (2 << 1) | (2 << 3) | (bas << 5);
+    }
     unsafe {
         let task = mach_task_self_;
         let (mut list, mut n) = (std::ptr::null_mut(), 0u32);

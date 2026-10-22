@@ -200,6 +200,7 @@ pub fn load(dir: &Path, names: &[&str], hle: &HashMap<&str, u64>) -> Result<Vec<
             *((kp + keypage::SPLIT_DIV as u64) as *mut u8) = split_div;
             *((kp + keypage::ASPECT as u64) as *mut f32) = crate::aspect::stretch() as f32;
         }
+        scale_frame_constants(m);
         let text_end = align_up(m.text, PAGE);
         let data_start = align_down(m.data.0, PAGE);
         a.set(m.base, text_end, Block { state: state::CODE, perm: perm::RX, attr: 0 })?;
@@ -230,6 +231,27 @@ fn display_config() -> [(u32, u64); 5] {
         (keypage::ROOT_HEAP, root),
         (keypage::OS_HEAP, os),
     ]
+}
+
+/// Experiment for NX_HZ: the 1/60 and 1/30 frame steps live in MK8D 4.0.1's rodata, shrink them to match the faster display clock.
+fn scale_frame_constants(m: &Module) {
+    const MK8DX_401_ID: [u8; 4] = [0x15, 0x8c, 0x0c, 0x73];
+    const STEPS: [(u64, f32); 2] = [(0xed5c90, 1.0 / 60.0), (0xed5c9c, 1.0 / 30.0)];
+    let scale = crate::gfx::frame().as_secs_f32() * 60.0;
+    if (scale - 1.0).abs() < 1e-3 || !m.module_id.starts_with(&MK8DX_401_ID) {
+        return;
+    }
+    for (off, step) in STEPS {
+        let p = (m.base + off) as *mut f32;
+        unsafe {
+            if p.read_unaligned() != step {
+                eprintln!("[loader] NX_HZ: unexpected value at {off:#x}, left alone");
+                continue;
+            }
+            p.write_unaligned(step * scale);
+        }
+        eprintln!("[loader] NX_HZ: frame step at {off:#x} now {:.5} s", step * scale);
+    }
 }
 
 fn split_div() -> u8 {

@@ -125,7 +125,7 @@ fn vsync_event() -> u32 {
         std::thread::Builder::new()
             .name("vsync".into())
             .spawn(move || {
-                let period = std::time::Duration::from_nanos(16_666_667);
+                let period = crate::gfx::frame();
                 let mut next = std::time::Instant::now();
                 loop {
                     next += if crate::gfx::turbo() { period / 8 } else { period };

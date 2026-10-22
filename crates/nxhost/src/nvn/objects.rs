@@ -174,6 +174,11 @@ fn state() -> std::sync::MutexGuard<'static, State> {
     STATE.lock().unwrap()
 }
 
+/// CPU ranges of every live memory pool, so host diagnostics can skip GPU data.
+pub fn pool_ranges() -> Vec<(u64, u64)> {
+    state().pools.values().map(|p| (p.cpu, p.size)).collect()
+}
+
 impl State {
     pub fn pool_offset_cpu(&self, pool: u64, offset: u64) -> Option<u64> {
         let p = self.pools.get(&pool)?;

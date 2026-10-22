@@ -27,6 +27,52 @@ pub fn current_guest_fp() -> u64 {
     GUEST_FP.with(|c| c.get())
 }
 
+fn mapped_code_or_data(addr: u64) -> bool {
+    let (_, _, b) = kernel::aspace().map.lock().unwrap().query(addr);
+    b.perm & perm::R != 0 && b.state != state::FREE
+}
+
+/// NX_TRACE_WAIT: which guest call sites block in WaitSynchronization, how often, and from where. The vsync wait of the main loop shows up as ~60 (or ~120 with NX_HZ) calls per second.
+fn trace_wait(f: &Frame, handles: usize, svc: u32) {
+    use std::collections::HashMap;
+    use std::sync::Mutex;
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    static SITES: Mutex<Option<(std::time::Instant, HashMap<u64, (u64, usize, Vec<u64>)>)>> = Mutex::new(None);
+    if !*ON.get_or_init(|| std::env::var_os("NX_TRACE_WAIT").is_some()) {
+        return;
+    }
+    let mut chain = vec![f.x[30]];
+    let mut fp = f.x[29];
+    for _ in 0..40 {
+        if fp == 0 || fp % 16 != 0 || !mapped_code_or_data(fp) || !mapped_code_or_data(fp + 8) {
+            break;
+        }
+        let (next, lr) = unsafe { (*(fp as *const u64), *((fp + 8) as *const u64)) };
+        chain.push(lr);
+        if next <= fp || next - fp > 1 << 20 {
+            break;
+        }
+        fp = next;
+    }
+    let mut g = SITES.lock().unwrap();
+    let (t0, map) = g.get_or_insert_with(|| (std::time::Instant::now(), HashMap::new()));
+    let key = chain.get(1).copied().unwrap_or(f.x[30]) ^ chain.get(2).copied().unwrap_or(0).rotate_left(1) ^ (svc as u64) << 56;
+    let e = map.entry(key).or_insert((0, handles | (svc as usize) << 32, chain));
+    e.0 += 1;
+    if t0.elapsed().as_secs() >= 10 {
+        let secs = t0.elapsed().as_secs_f64();
+        let mut rows: Vec<_> = map.iter().collect();
+        rows.sort_by_key(|(_, v)| std::cmp::Reverse(v.0));
+        eprintln!("[wait] {} call sites in {secs:.0} s", rows.len());
+        for (lr, (n, h, bt)) in rows.iter().take(8) {
+            let bt: Vec<String> = bt.iter().map(|a| format!("{a:#x}")).collect();
+            let _ = lr;
+            eprintln!("[wait] {:7.1}/s  svc={:#x} handles={}  chain={}", *n as f64 / secs, h >> 32, h & 0xFFFF_FFFF, bt.join(" "));
+        }
+        *g = None;
+    }
+}
+
 #[unsafe(no_mangle)]
 pub extern "C" fn dispatch(f: &mut Frame) {
     GUEST_FP.with(|c| c.set(f.x[29]));
@@ -164,6 +210,7 @@ fn dispatch_inner(f: &mut Frame) {
         }
         0x18 => {
             let handles = unsafe { std::slice::from_raw_parts(x[1] as *const u32, x[2] as usize) }.to_vec();
+            trace_wait(f, handles.len(), 0x18);
             let (r, idx) = kernel::wait_synchronization(&handles, x[3] as i64);
             f.x[1] = idx as u64;
             r
@@ -178,7 +225,10 @@ fn dispatch_inner(f: &mut Frame) {
         0x1A => kernel::arbitrate_lock(x[0] as u32, x[1], x[2] as u32),
         0x1B => kernel::arbitrate_unlock(x[0]),
         0x1C => kernel::wait_process_wide_key(x[0], x[1], x[2] as u32, x[3] as i64),
-        0x1D => kernel::signal_process_wide_key(x[0], x[1] as i32),
+        0x1D => {
+            trace_wait(f, 0, 0x1D);
+            kernel::signal_process_wide_key(x[0], x[1] as i32)
+        }
         0x1E => {
             f.x[0] = system_tick();
             return;

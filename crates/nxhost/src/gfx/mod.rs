@@ -425,14 +425,21 @@ fn present_params(tex: &Texture, flip: bool) -> (PresentParams, f64) {
 }
 
 pub fn present(tex: &Texture, flip: bool) {
+    present_frames(&[tex], flip);
+}
+
+/// Shows `texs` within one game frame: the first right away, the others spread evenly across the frame. Frame
+/// interpolation passes its in-between images first and the real frame last.
+pub fn present_frames(texs: &[&Texture], flip: bool) {
     #[cfg(target_os = "ios")]
     if !ios::ACTIVE.load(std::sync::atomic::Ordering::Relaxed) {
         return;
     }
     let turbo = next_frame();
+    crate::probe::frame(clock());
     let interval = PRESENT_INTERVAL.load(std::sync::atomic::Ordering::Relaxed);
     if turbo {
-        pace(FRAME / 4);
+        pace(frame() / 4);
         static SHOWN: std::sync::Mutex<Option<std::time::Instant>> = std::sync::Mutex::new(None);
         let mut shown = SHOWN.lock().unwrap();
         if shown.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(50)) {
@@ -440,7 +447,7 @@ pub fn present(tex: &Texture, flip: bool) {
         }
         *shown = Some(std::time::Instant::now());
     } else if interval > 0 {
-        pace(FRAME * interval);
+        pace(frame() * interval);
     }
     let Some(layer) = LAYER.get() else { return };
     let bounds = layer.0.bounds().size;
@@ -449,38 +456,45 @@ pub fn present(tex: &Texture, flip: bool) {
     if layer.0.drawableSize() != size {
         layer.0.setDrawableSize(size);
     }
-    let Some(drawable) = layer.0.nextDrawable() else { return };
-    let g = gpu();
-    let Some(cb) = g.queue.0.commandBuffer() else { return };
-    let desc = MTLRenderPassDescriptor::new();
-    let att = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
-    att.setTexture(Some(&drawable.texture()));
-    att.setLoadAction(MTLLoadAction::Clear);
-    att.setClearColor(MTLClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0 });
-    att.setStoreAction(MTLStoreAction::Store);
-    if let Some(enc) = cb.renderCommandEncoderWithDescriptor(&desc) {
-        let (params, aspect) = present_params(tex, flip);
-        let aspect = aspect * crate::aspect::stretch();
-        ASPECT.store(aspect.to_bits(), std::sync::atomic::Ordering::Relaxed);
-        enc.setViewport(letterbox(aspect, size.width, size.height));
-        enc.setRenderPipelineState(&g.present.0);
-        unsafe {
-            let p = std::ptr::NonNull::from(&params).cast();
-            enc.setVertexBytes_length_atIndex(p, size_of::<PresentParams>(), 0);
-            enc.setFragmentBytes_length_atIndex(p, size_of::<PresentParams>(), 0);
-            enc.setFragmentTexture_atIndex(Some(tex), 0);
-            enc.setFragmentSamplerState_atIndex(Some(&g.sampler.0), 0);
-            enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+    let texs = if turbo { &texs[texs.len() - 1..] } else { texs };
+    let gap = frame().as_secs_f64() * interval.max(1) as f64 / texs.len() as f64;
+    let t0 = objc2_quartz_core::CACurrentMediaTime();
+    for (i, tex) in texs.iter().enumerate() {
+        let Some(drawable) = layer.0.nextDrawable() else { return };
+        let g = gpu();
+        let Some(cb) = g.queue.0.commandBuffer() else { return };
+        let desc = MTLRenderPassDescriptor::new();
+        let att = unsafe { desc.colorAttachments().objectAtIndexedSubscript(0) };
+        att.setTexture(Some(&drawable.texture()));
+        att.setLoadAction(MTLLoadAction::Clear);
+        att.setClearColor(MTLClearColor { red: 0.0, green: 0.0, blue: 0.0, alpha: 1.0 });
+        att.setStoreAction(MTLStoreAction::Store);
+        if let Some(enc) = cb.renderCommandEncoderWithDescriptor(&desc) {
+            let (params, aspect) = present_params(tex, flip);
+            let aspect = aspect * crate::aspect::stretch();
+            ASPECT.store(aspect.to_bits(), std::sync::atomic::Ordering::Relaxed);
+            enc.setViewport(letterbox(aspect, size.width, size.height));
+            enc.setRenderPipelineState(&g.present.0);
+            unsafe {
+                let p = std::ptr::NonNull::from(&params).cast();
+                enc.setVertexBytes_length_atIndex(p, size_of::<PresentParams>(), 0);
+                enc.setFragmentBytes_length_atIndex(p, size_of::<PresentParams>(), 0);
+                enc.setFragmentTexture_atIndex(Some(*tex), 0);
+                enc.setFragmentSamplerState_atIndex(Some(&g.sampler.0), 0);
+                enc.drawPrimitives_vertexStart_vertexCount(MTLPrimitiveType::Triangle, 0, 3);
+            }
+            enc.endEncoding();
         }
-        enc.endEncoding();
+        let d: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
+        if texs.len() > 1 {
+            cb.presentDrawable_atTime(d, t0 + gap * i as f64);
+        } else if interval == 0 || turbo {
+            cb.presentDrawable(d);
+        } else {
+            cb.presentDrawable_afterMinimumDuration(d, frame().as_secs_f64() * interval as f64);
+        }
+        cb.commit();
     }
-    let d: &ProtocolObject<dyn MTLDrawable> = ProtocolObject::from_ref(&*drawable);
-    if interval == 0 || turbo {
-        cb.presentDrawable(d);
-    } else {
-        cb.presentDrawable_afterMinimumDuration(d, interval as f64 / 60.0);
-    }
-    cb.commit();
 }
 
 static ASPECT: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
@@ -522,7 +536,16 @@ fn letterbox(aspect: f64, w: f64, h: f64) -> MTLViewport {
 
 static PRESENT_INTERVAL: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(1);
 
-const FRAME: std::time::Duration = std::time::Duration::from_nanos(16_666_667);
+/// One vsync period; NX_HZ=120 is an experiment to see how the game reacts to a faster display clock.
+pub fn frame() -> std::time::Duration {
+    static F: std::sync::LazyLock<std::time::Duration> = std::sync::LazyLock::new(|| {
+        match std::env::var("NX_HZ").ok().and_then(|v| v.parse::<f64>().ok()) {
+            Some(hz) if (30.0..=240.0).contains(&hz) => std::time::Duration::from_secs_f64(1.0 / hz),
+            _ => std::time::Duration::from_nanos(16_666_667),
+        }
+    });
+    *F
+}
 static FRAMES: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 static START: std::sync::LazyLock<std::time::Instant> = std::sync::LazyLock::new(std::time::Instant::now);
 static TURBO_UNTIL: std::sync::LazyLock<Option<f32>> = std::sync::LazyLock::new(|| env_secs("NX_TURBO"));

@@ -5,6 +5,7 @@ mod draw;
 mod fx;
 pub use draw::{precompile, prewarm};
 mod objects;
+pub use objects::pool_ranges;
 mod tex;
 
 use crate::stubs::{self, Args};

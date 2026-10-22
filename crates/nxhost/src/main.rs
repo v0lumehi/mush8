@@ -19,6 +19,7 @@ mod services;
 mod shm;
 mod stubs;
 mod nvn;
+mod probe;
 mod svc;
 
 use anyhow::{Context, Result};

@@ -14,6 +14,19 @@ fn rd<T: Copy>(addr: u64) -> T {
 
 impl Replay<'_> {
     pub(super) fn draw(&mut self, d: &super::Draw) -> Result<(), &'static str> {
+        let r = self.draw_inner(d);
+        if self.interp {
+            let i = match r {
+                Ok(()) => 0,
+                Err(e) if e.starts_with("shader") => 1,
+                Err(_) => 2,
+            };
+            super::interp::OUTCOMES[i].fetch_add(1, Relaxed);
+        }
+        r
+    }
+
+    fn draw_inner(&mut self, d: &super::Draw) -> Result<(), &'static str> {
         if d.count == 0 || d.instances == 0 || self.e.st.rasterizer_discard || !self.e.st.render_enable {
             return Ok(());
         }
@@ -29,6 +42,16 @@ impl Replay<'_> {
             }
         }
         let (Some(vs), Some(fs)) = (vs, fs) else { return Err("program without vertex+fragment stages") };
+        if *super::stats::ON {
+            self.record_stats(&st, (vs.hash, fs.hash));
+        }
+        if *super::interp::ON {
+            self.cur_draw = self.e.interp.draw_index;
+            self.e.interp.draw_index += 1;
+            if !self.interp {
+                self.capture_ubos(&st, (vs.hash, fs.hash), d);
+            }
+        }
         self.ensure_pass()?;
         let targets = self.pass.as_ref().unwrap().targets.clone();
         let (mut uints, mut sints) = (0, 0);
@@ -249,6 +272,50 @@ impl Replay<'_> {
         Ok(())
     }
 
+    /// Where the bytes behind a uniform binding are right now: this frame's inline update if there is one, else guest memory.
+    fn ubo_ptr(&self, addr: u64) -> (*const u8, bool) {
+        match self.e.overlays.range(..=addr).next_back().filter(|&(&b, &(s, _, _))| addr < b + s) {
+            Some((&b, &(_, _, p))) => ((p as u64 + (addr - b)) as *const u8, true),
+            None => (addr as *const u8, false),
+        }
+    }
+
+    fn capture_ubos(&mut self, st: &super::GState, program: (u64, u64), d: &super::Draw) {
+        let geometry = (st.vbufs[0].0, st.vbufs[1].0, d.index.map(|i| i.1), d.mode, d.count, d.first, d.base_vertex);
+        let mesh = super::stats::hash(format!("{program:?}{geometry:?}").as_bytes());
+        let slots: Vec<_> = (0..2)
+            .flat_map(|stage| st.ubos[stage].iter().enumerate().map(move |(i, &(addr, size))| (stage as u8, i as u8, addr, size)))
+            .filter(|s| s.2 != 0)
+            .map(|(stage, i, addr, size)| {
+                let (ptr, inline) = self.ubo_ptr(addr);
+                (stage, i, addr, size, inline.then_some(ptr))
+            })
+            .collect();
+        let target = self.e.colors.first().cloned().flatten().and_then(|b| super::textures::TexKey::of(&b)).map_or(0, |k| k.addr);
+        let depth = self.e.depth.is_some();
+        self.e.interp.cur.cap.record(program, mesh, target, depth, slots.into_iter());
+    }
+
+    fn record_stats(&self, st: &super::GState, program: (u64, u64)) {
+        let mut ubos = Vec::new();
+        for stage in 0..2 {
+            for (i, &(addr, size)) in st.ubos[stage].iter().enumerate() {
+                if addr == 0 {
+                    continue;
+                }
+                let len = size.min(0x400) as usize;
+                let overlay = self.e.overlays.range(..=addr).next_back().filter(|&(&b, &(s, _, _))| addr < b + s);
+                let ptr = match overlay {
+                    Some((&b, &(_, _, p))) => (p as u64 + (addr - b)) as *const u8,
+                    None => addr as *const u8,
+                };
+                let hash = super::stats::hash(unsafe { std::slice::from_raw_parts(ptr, len) });
+                ubos.push((stage as u8, i as u8, addr, size, hash, overlay.is_some()));
+            }
+        }
+        super::stats::record(program, ubos.into_iter());
+    }
+
     fn res(&mut self, st: &super::GState, stage: usize, constants: u64, flags: u32) -> Res {
         let zeros = gfx::gpu().zeros.0.gpuAddress();
         let mut r = Res {
@@ -305,9 +372,14 @@ impl Replay<'_> {
             self.e.bank_gpu[stage] = a.gpu;
             self.e.bank_ok[stage] = true;
         }
+        let blended = if self.interp { self.e.interp.overrides.get(self.cur_draw) } else { None };
         for (i, &(addr, _)) in st.ubos[stage].iter().enumerate() {
             if addr != 0 {
-                r.cb[3 + i] = self.gpu(addr, true);
+                let mixed = blended.and_then(|o| o.iter().find(|&&(s, x, _)| s as usize == stage && x as usize == i));
+                if mixed.is_some() {
+                    super::interp::BOUND.fetch_add(1, Relaxed);
+                }
+                r.cb[3 + i] = mixed.map_or_else(|| self.gpu(addr, true), |m| m.2);
             }
         }
         r

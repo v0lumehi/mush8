@@ -2,8 +2,10 @@
 // Constantin Clerc (c22dev) - 0.1
 mod copy;
 mod exec;
+mod interp;
 mod shaders;
 mod state;
+mod stats;
 mod textures;
 
 use super::cmd::{self, Cmd, Draw, TexBuilder};
@@ -50,6 +52,7 @@ struct Engine {
     sampled: HashMap<textures::TexKey, Shared<gfx::Texture>>,
     touched: Vec<(textures::TexKey, Shared<gfx::Texture>)>,
     clears: Vec<PendingClear>,
+    interp: interp::State,
 }
 
 struct PendingClear {
@@ -112,6 +115,9 @@ struct Replay<'a> {
     pass: Option<Pass>,
     heap: Option<&'static gfx::HeapBuffer>,
     passes: u32,
+    /// Replaying a finished frame to draw an in-between image: no writes back to guest memory, no compute.
+    interp: bool,
+    cur_draw: usize,
 }
 
 impl Replay<'_> {
@@ -158,7 +164,8 @@ impl Replay<'_> {
                 Cmd::Call(handles) => {
                     if depth < 8 {
                         for h in handles {
-                            if let Some(sub) = cmd::recording(*h) {
+                            let sub = if self.interp { self.e.interp.calls.get(h).cloned() } else { cmd::recording(*h) };
+                            if let Some(sub) = sub {
                                 self.run(&sub, depth + 1);
                             }
                         }
@@ -211,6 +218,12 @@ impl Replay<'_> {
                 Cmd::SamplerPool(p) => st.sampler_pool = *p,
                 Cmd::DepthClamp(v) => st.depth_clamp = *v,
                 Cmd::RasterizerDiscard(v) => st.rasterizer_discard = *v,
+                Cmd::ReportCounter { .. } if self.interp => {}
+                Cmd::CopyTextureToBuffer { .. } if self.interp => {}
+                // Uploads from guest memory: the texture already holds what the real frame copied, and the source may
+                // already hold the next video frame or streamed data.
+                Cmd::CopyBufferToTexture { .. } if self.interp => {}
+                Cmd::Dispatch(_) if self.interp && !*interp::KEEP_COMPUTE => {}
                 Cmd::ReportCounter { counter, addr } => {
                     static T0: LazyLock<std::time::Instant> = LazyLock::new(std::time::Instant::now);
                     let ns = T0.elapsed().as_nanos() as u64;
@@ -242,6 +255,13 @@ impl Replay<'_> {
                     let _ = r;
                 }
                 Cmd::CopyTextureToBuffer { src, region, dst } => {
+                    if *interp::ON {
+                        let format = u32::from_le_bytes(src[0x30..0x34].try_into().unwrap());
+                        let (bw, bh, bpb) = super::format_info(format);
+                        let [_, _, _, w, h, d] = region.map(|v| v.max(0) as u64);
+                        let size = w.div_ceil(bw as u64) * bpb as u64 * h.div_ceil(bh as u64) * d.max(1);
+                        self.e.interp.cur.gpu_written.push((*dst, size));
+                    }
                     self.end_pass();
                     self.flush_clears();
                     let format = u32::from_le_bytes(src[0x30..0x34].try_into().unwrap());
@@ -265,6 +285,10 @@ impl Replay<'_> {
                 }
                 Cmd::RenderEnable(v) => st.render_enable = *v,
                 Cmd::Dispatch(groups) => {
+                    if *interp::ON {
+                        let written = self.e.st.storage.iter().flatten().filter(|s| s.0 != 0).copied().collect::<Vec<_>>();
+                        self.e.interp.cur.gpu_written.extend(written);
+                    }
                     self.end_pass();
                     self.flush_clears();
                     let r = self.dispatch(*groups);
@@ -508,8 +532,23 @@ pub fn submit(handles: &[u64]) {
         e.forget_dead();
         e.bank_ok = [false; 3];
         e.textures.frame += 1;
+        if *interp::ON {
+            let e = &mut *e;
+            if *interp::TRACE {
+                let draws: usize = handles.iter().filter_map(|h| cmd::recording(*h)).map(|c| count_draws(&c, 0)).sum();
+                eprintln!("[interp-trace] submit {} buffers, {draws} draws", handles.len());
+            }
+            if e.interp.cur.start.is_none() {
+                e.interp.cur.start = Some(interp::Start { st: e.st, colors: e.colors.clone(), depth: e.depth.clone() });
+                e.interp.draw_index = 0;
+            }
+            for c in handles.iter().filter_map(|h| cmd::recording(*h)) {
+                e.interp.cur.keep_calls(&c, 0);
+                e.interp.cur.cmds.push(c);
+            }
+        }
         let Some(cb) = gfx::gpu().queue.0.commandBuffer() else { return };
-        let mut r = Replay { e: &mut e, cb, pass: None, heap: None, passes: 0 };
+        let mut r = Replay { e: &mut e, cb, pass: None, heap: None, passes: 0, interp: false, cur_draw: 0 };
         let mut updated = BTreeMap::new();
         for h in handles {
             if let Some(cmds) = cmd::recording(*h) {
@@ -521,6 +560,9 @@ pub fn submit(handles: &[u64]) {
             let src = unsafe { std::slice::from_raw_parts(addr as *const u8, size) };
             let a = r.e.arena.alloc_bytes(src);
             r.e.overlays.insert(addr, (size as u64, a.gpu, a.ptr as usize));
+        }
+        if *stats::ON {
+            stats::updates(updated.len(), updated.values().sum());
         }
         static N: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
         let n = N.fetch_add(1, Relaxed);
@@ -651,21 +693,219 @@ fn count_fps() {
     }
 }
 
+/// NX_TRACE_PRESENT: the guest call chain that presents a frame. Its callers up the chain are the per-frame loop (simulation + draw).
+#[inline(never)]
+fn trace_present() {
+    use std::collections::HashMap;
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var_os("NX_TRACE_PRESENT").is_some());
+    static SITES: Mutex<Option<(std::time::Instant, HashMap<u64, (u64, Vec<u64>)>)>> = Mutex::new(None);
+    if !*ON {
+        return;
+    }
+    let mut fp: u64;
+    unsafe { std::arch::asm!("mov {}, x29", out(reg) fp) };
+    let mut chain = Vec::new();
+    let readable = |a: u64| {
+        if a < 0x70_0000_0000 {
+            return a != 0;
+        }
+        let (_, _, b) = crate::kernel::aspace().map.lock().unwrap().query(a);
+        b.perm & crate::mem::perm::R != 0 && b.state != crate::mem::state::FREE
+    };
+    let mut prev = 0u64;
+    for _ in 0..40 {
+        let same_stack = prev == 0 || (fp > prev && fp - prev < 1 << 20);
+        if fp == 0 || fp % 16 != 0 || !(same_stack || readable(fp)) {
+            break;
+        }
+        let (next, lr) = unsafe { (*(fp as *const u64), *((fp + 8) as *const u64)) };
+        chain.push(lr);
+        if next == fp {
+            break;
+        }
+        prev = fp;
+        fp = next;
+    }
+    let key = chain.iter().fold(0u64, |a, v| a.rotate_left(5) ^ v);
+    let mut g = SITES.lock().unwrap();
+    let (t0, map) = g.get_or_insert_with(|| (std::time::Instant::now(), HashMap::new()));
+    map.entry(key).or_insert((0, chain)).0 += 1;
+    if t0.elapsed().as_secs() >= 10 {
+        let secs = t0.elapsed().as_secs_f64();
+        let mut rows: Vec<_> = map.values().collect();
+        rows.sort_by_key(|v| std::cmp::Reverse(v.0));
+        for (n, bt) in rows.iter().take(4) {
+            let bt: Vec<String> = bt.iter().map(|a| format!("{a:#x}")).collect();
+            eprintln!("[present] {:6.1}/s  chain={}", *n as f64 / secs, bt.join(" "));
+        }
+        *g = None;
+    }
+}
+
 pub fn present(texture: u64) {
+    trace_present();
     count_fps();
+    if *stats::ON {
+        stats::frame_end();
+    }
     objc2::rc::autoreleasepool(|_| {
         let b = super::objects::texture(texture).map(|t| t.builder);
         let Some(b) = b else { return };
-        let t = {
+        let (t, real) = {
             let mut e = ENGINE.lock().unwrap();
             e.forget_dead();
-            e.textures.get(&b, true)
+            let t = e.textures.get(&b, true);
+            let real = match &t {
+                Some((k, t)) if *interp::ON => {
+                    if *interp::TRACE {
+                        eprintln!("[interp-trace] present {:#x} after {} draws", k.addr, e.interp.cur.cap.draws());
+                    }
+                    interpolate(&mut e, t, k.addr)
+                }
+                _ => None,
+            };
+            (t, real)
         };
         if let Some((_, t)) = t {
-            dump_at(&t);
-            crate::kernel::blocking(|| gfx::present(&t.0, !UPPER_LEFT.load(Relaxed)));
+            let flip = !UPPER_LEFT.load(Relaxed);
+            match real {
+                Some((real, true)) => {
+                    dump_at(&real);
+                    dump_interp(&t, &real);
+                    crate::kernel::blocking(|| gfx::present_frames(&[&t.0, &real.0], flip));
+                }
+                Some((real, false)) => {
+                    dump_at(&real);
+                    crate::kernel::blocking(|| gfx::present(&real.0, flip));
+                }
+                None => {
+                    dump_at(&t);
+                    crate::kernel::blocking(|| gfx::present(&t.0, flip));
+                }
+            }
         }
     });
+}
+
+/// Replays the frame that just finished halfway between the last frame and this one, into the game's own render targets.
+/// The real image is copied aside first and returned, to be shown after the in-between one now in `window`; `false` with
+/// it means the replay went wrong and only the real image may be shown.
+fn interpolate(e: &mut Engine, window: &Shared<gfx::Texture>, screen: u64) -> Option<(Shared<gfx::Texture>, bool)> {
+    let frame = std::mem::take(&mut e.interp.cur);
+    let prev = e.interp.prev.take();
+    let mut cap = frame.cap;
+    cap.fill();
+    let result = (|| {
+        let (prev, start) = (prev.as_ref()?, frame.start?);
+        if frame.cmds.is_empty() || gfx::turbo() {
+            return None;
+        }
+        let g = gfx::gpu();
+        let w = &window.0;
+        let fits = |h: &Shared<gfx::Texture>| h.0.width() == w.width() && h.0.height() == w.height() && h.0.pixelFormat() == w.pixelFormat();
+        if !e.interp.hold.as_ref().is_some_and(fits) {
+            let d = unsafe { MTLTextureDescriptor::texture2DDescriptorWithPixelFormat_width_height_mipmapped(w.pixelFormat(), w.width(), w.height(), false) };
+            d.setStorageMode(MTLStorageMode::Private);
+            d.setUsage(MTLTextureUsage::ShaderRead | MTLTextureUsage::RenderTarget);
+            e.interp.hold = Some(Shared(g.device.0.newTextureWithDescriptor(&d)?));
+        }
+        let hold = e.interp.hold.clone()?;
+        let cb = g.queue.0.commandBuffer()?;
+        let blit = cb.blitCommandEncoder()?;
+        unsafe { blit.copyFromTexture_toTexture(w, &hold.0) };
+        blit.endEncoding();
+
+        let arena = &mut e.arena;
+        let (overrides, built) = interp::build(prev, &cap, *interp::T, screen, &frame.gpu_written, |bytes| arena.alloc_bytes(bytes).gpu);
+        static LOGGED: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+        if LOGGED.fetch_add(1, Relaxed) % 600 == 0 {
+            let o: Vec<usize> = interp::OUTCOMES.iter().map(|c| c.swap(0, Relaxed)).collect();
+            eprintln!(
+                "[interp] {} draws ({} 2D), {} paired, {} uniform buffers blended ({} words, {} KB, {} KB kept as drawn, {} read live) | last replays: {} blended bindings, draws ran {} / shader wait {} / failed {}",
+                built.draws,
+                built.hud,
+                built.paired,
+                built.slots,
+                built.words,
+                built.bytes >> 10,
+                built.kept_bytes >> 10,
+                built.live,
+                interp::BOUND.swap(0, Relaxed),
+                o[0],
+                o[1],
+                o[2]
+            );
+        }
+        e.interp.overrides = overrides;
+        e.interp.draw_index = 0;
+        let end = (e.st, std::mem::take(&mut e.colors), e.depth.take());
+        e.st = start.st;
+        e.colors = start.colors;
+        e.depth = start.depth;
+        e.bank_ok = [false; 3];
+        let mut updated = BTreeMap::new();
+        for c in &frame.cmds {
+            collect_updates(c, 0, &mut updated);
+        }
+        e.interp.calls = frame.calls;
+        let mut r = Replay { e: &mut *e, cb, pass: None, heap: None, passes: 0, interp: true, cur_draw: 0 };
+        for (&addr, &size) in &updated {
+            let size = size.min(0x10000) as usize;
+            let a = r.e.arena.alloc_bytes(unsafe { std::slice::from_raw_parts(addr as *const u8, size) });
+            r.e.overlays.insert(addr, (size as u64, a.gpu, a.ptr as usize));
+        }
+        for c in &frame.cmds {
+            r.run(c, 0);
+        }
+        r.end_pass();
+        r.flush_clears();
+        let cb = r.cb;
+        commit(&cb);
+        // The replay reads the game's vertex, index and storage buffers too. A fence the game set on this frame must
+        // also cover it, or the game rewrites those buffers for the next frame while the replay is still reading them.
+        let cb = Shared(cb);
+        if let Some(real) = e.last_submit.take() {
+            let real = Retained::as_ptr(&real.0);
+            for s in e.syncs.values_mut() {
+                if Retained::as_ptr(&s.0) == real {
+                    *s = cb.clone();
+                }
+            }
+        }
+        e.last_submit = Some(cb.clone());
+        e.arena.retire(cb);
+        e.overlays.clear();
+        e.interp.overrides.clear();
+        e.interp.calls.clear();
+        (e.st, e.colors, e.depth) = end;
+        e.bank_ok = [false; 3];
+        // The replay must have walked the same draws in the same order, or the blended buffers went to the wrong ones.
+        if e.interp.draw_index != cap.draws() {
+            static MISMATCH: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if MISMATCH.fetch_add(1, Relaxed) % 60 == 0 {
+                eprintln!("[interp] replay drew {} draws, the frame {}: in-between image dropped", e.interp.draw_index, cap.draws());
+            }
+            return Some((hold, false));
+        }
+        Some((hold, true))
+    })();
+    e.interp.prev = Some(cap);
+    result
+}
+
+/// NX_INTERP_DUMP=<game s>: saves the in-between and the real image of NX_INTERP_DUMP_N (3) frames from then on.
+fn dump_interp(mid: &Shared<gfx::Texture>, real: &Shared<gfx::Texture>) {
+    static AT: LazyLock<Option<f32>> = LazyLock::new(|| std::env::var("NX_INTERP_DUMP").ok().and_then(|v| v.parse().ok()));
+    static COUNT: LazyLock<u32> = LazyLock::new(|| std::env::var("NX_INTERP_DUMP_N").ok().and_then(|v| v.parse().ok()).unwrap_or(3));
+    static DONE: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if !AT.is_some_and(|t| gfx::clock() >= t) || DONE.load(Relaxed) >= *COUNT {
+        return;
+    }
+    let n = DONE.fetch_add(1, Relaxed);
+    let _ = std::fs::create_dir_all("work/frame");
+    gfx::dump_png(&mid.0, &format!("work/frame/interp{n:02}-a-mid.png"));
+    gfx::dump_png(&real.0, &format!("work/frame/interp{n:02}-b-real.png"));
+    eprintln!("[interp] frame {n} dumped");
 }
 
 pub fn write_texels(mut b: TexBuilder, view: u64, region: [i32; 6], data: *const u8, strides: Option<(usize, usize)>) {
@@ -790,6 +1030,16 @@ fn dump_at(t: &Shared<gfx::Texture>) {
         gfx::dump_png(&t.0, &format!("work/frame/t{at:05.1}.png"));
         eprintln!("[gfx] screen at {at}s dumped");
     }
+}
+
+fn count_draws(cmds: &[Cmd], depth: usize) -> usize {
+    cmds.iter()
+        .map(|c| match c {
+            Cmd::Draw(_) => 1,
+            Cmd::Call(handles) if depth < 8 => handles.iter().filter_map(|h| cmd::recording(*h)).map(|s| count_draws(&s, depth + 1)).sum(),
+            _ => 0,
+        })
+        .sum()
 }
 
 fn collect_updates(cmds: &[Cmd], depth: usize, out: &mut BTreeMap<u64, u64>) {
